@@ -225,73 +225,152 @@ class Cipher {
     
     /// Extract the name of the function that computes the throttling parameter.
     class func getThrottlingFunctionName(js: String) throws -> String {
-        // ❶ new: b holds the string "n"
-        let patternVarIntro = #"""
-        (?x)
-          (?P<var>[a-zA-Z0-9_$]+)\s*=\s*
-          (?:
-              "n"                                    #   b = "n"
-            | String\.fromCharCode\(\s*110\s*\)      #   b = String.fromCharCode(110)
-          )
-        """#
+        
+        if #available(iOS 16.0, macOS 13.0, watchOS 9.0, tvOS 16.0, *) {
+            var functionName: String = ""
+            var index: Int?
 
-        // ❷ new: generic “read n” followed by the function call
-        let patternFunctionCall = #"""
-        (?x)
-          (?:
-               a\.
-                 (?:
-                    get\(\s*\k<var>\s*\)              # a.get(b)
-                  | [a-zA-Z0-9_$]+\[\s*\k<var>\s*\]   # a[b]   or  someObj[b]
-                 )
-               \s*\|\|\s*null
-             )\s*
-             \)\s*&&\s*\(c=\s*        # …)&&(
-             (?P<nfunc>[a-zA-Z0-9_$]+)   # <-- wanted name
-             (?:\[(?P<idx>\d+)\])?       # optional constant-index lookup
-             \(\s*[a-zA-Z]\s*\)          # call with single arg
-        """#
-
-        // объединяем
-        let complete = try NSRegularExpression(
-            pattern: patternVarIntro + patternFunctionCall,
-            options: [.dotMatchesLineSeparators, .allowCommentsAndWhitespace]
-        )
-
-        guard let m = complete.firstMatch(in: js, range: NSRange(location: 0, length: js.utf16.count)) else {
-            throw YouTubeKitError.regexMatchError
-        }
-
-        let src = js as NSString
-        let nameRange = m.range(withName: "nfunc")
-        guard nameRange.location != NSNotFound else {
-            throw YouTubeKitError.regexMatchError
-        }
-        let name = src.substring(with: nameRange)
-
-        var index: Int? = nil
-        let idxRange = m.range(withName: "idx")
-        if idxRange.location != NSNotFound {
-            index = Int(src.substring(with: idxRange))
-        }
-
-        // если был массив-обёртка вида  var X=[f1,f2,…] – достаём нужный элемент
-        if let idx = index {
-            let arrayPattern = NSRegularExpression(
-                #"var\s+"# + NSRegularExpression.escapedPattern(for: name) + #"\s*=\s*(\[[^\]]+\])"#
+            // ------------------------------------------------------------
+            // ❶ Handle the “var … = [nfunc]” / “var …[idx] = nfunc” case.
+            //    This replicates the Python re.finditer logic, capturing
+            //    both the function name (group 2) and optional index (group 1).
+            // ------------------------------------------------------------
+            do {
+                let arrayAssign = try NSRegularExpression(
+                    pattern: #"""
+                        [\n;]var\s                    # ;var / \nvar
+                        (?:(?:(?!,).)+,|\s)*?         # skip other vars
+                        (?!\d)[\w$]+                  # variable name
+                        (?:\[(\d+)\])?                #  idx   (group 1)
+                        \s*=\s*
+                        (?:\[\s*)?                    # optional '['
+                        ([A-Za-z0-9_$]+)              # nfunc (group 2)
+                        (?:\s*\])?                    # optional ']'
+                        \s*?[;\n]                     # statement end
+                    """#,
+                    options: [.dotMatchesLineSeparators,
+                              .allowCommentsAndWhitespace]
+                )
+                
+                if let m = arrayAssign.firstMatch(in: js, range: NSRange(js.startIndex..., in: js)),
+                   let fnRange = Range(m.range(at: 2), in: js) {
+                    
+                    // extract function name and optional index
+                    let nfunc = String(js[fnRange])
+                    let idx: Int? = {
+                        let r = m.range(at: 1)
+                        guard r.location != NSNotFound,
+                              let idxRange = Range(r, in: js) else { return nil }
+                        return Int(js[idxRange])
+                    }()
+                    
+                    functionName = nfunc
+                    index = idx
+                    
+                    if index == nil {
+                        return functionName
+                    }
+                }
+            } catch {
+                // regex construction failed – continue with next patterns
+            }
+            
+            /*
+             Full regex pattern:
+             """
+             (?x)
+             (?:
+             \.get\("n"\)\)&&\(b=|
+             (?:
+             b=String\.fromCharCode\(110\)|
+             (?P<str_idx>[a-zA-Z0-9_$.]+)&&\(b="nn"\[\+(?P=str_idx)\]
+             )
+             (?:
+             ,[a-zA-Z0-9_$]+\(a\))?,c=a\.
+             (?:
+             get\(b\)|
+             [a-zA-Z0-9_$]+\[b\]\|\|null
+             )\)&&\(c=|
+             \b(?P<var>[a-zA-Z0-9_$]+)=
+             )(?P<nfunc>[a-zA-Z0-9_$]+)(?:\[(?P<idx>\d+)\])?\([a-zA-Z]\)
+             (?(var),[a-zA-Z0-9_$]+\.set\((?:"n+"|[a-zA-Z0-9_$]+)\,(?P=var)\))
+             """
+             
+             -> We split it up in two, as Swift can't handle the conditional (on the last line). So we handle it in code
+             */
+            
+            let patternWithVar = #/
+            (?x)
+            (?:
+            \b(?P<var>[a-zA-Z0-9_$]+)=
+            )(?P<nfunc>[a-zA-Z0-9_$]+)(?:\[(?P<idx>\d+)\])?\([a-zA-Z]\)
+            (,[a-zA-Z0-9_$]+\.set\((?:"n+"|[a-zA-Z0-9_$]+)\,(?P=var)\))
+            /#
+            
+            let patternWithoutVar = #/
+            (?x)
+            (?:
+            \.get\("n"\)\)&&\(b=|
+            (?:
+            b=String\.fromCharCode\(110\)|
+            (?P<str_idx>[a-zA-Z0-9_$.]+)&&\(b="nn"\[\+(?P=str_idx)\]
             )
-            if let arrayMatch = arrayPattern.firstMatch(in: js, group: 1) {
-                let elements = arrayMatch.content
-                    .trimmingCharacters(in: CharacterSet(charactersIn: "[]"))
-                    .split(separator: ",")
-                    .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-                if elements.indices.contains(idx) {
-                    return elements[idx]
+            (?:
+            ,[a-zA-Z0-9_$]+\(a\))?,c=a\.
+            (?:
+            get\(b\)|
+            [a-zA-Z0-9_$]+\[b\]\|\|null
+            )\)&&\(c=
+            )(?P<nfunc>[a-zA-Z0-9_$]+)(?:\[(?P<idx>\d+)\])?\([a-zA-Z]\)
+            /#
+            
+            if let match = try patternWithVar.firstMatch(in: js) {
+                functionName = String(match.nfunc)
+                index = match.idx.flatMap { Int($0) }
+            } else if let match = try patternWithoutVar.firstMatch(in: js) {
+                functionName = String(match.nfunc)
+                index = match.idx.flatMap { Int($0) }
+            } else {
+                throw YouTubeKitError.regexMatchError
+            }
+            
+            // At the end of the #available branch, handle array lookup/return if functionName was found:
+            if !functionName.isEmpty {
+                let arrayPattern = NSRegularExpression(#"var "# + NSRegularExpression.escapedPattern(for: functionName) + #"\s*=\s*(\[.+?\])\s*[,;]"#)
+                if let arrayMatch = arrayPattern.firstMatch(in: js, group: 1) {
+                    let array = arrayMatch.content.strip(from: "[]").split(separator: ",").map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                    if let index, array.indices.contains(index) {
+                        return array[index]
+                    }
+                }
+                throw YouTubeKitError.regexMatchError
+            }
+        } else {
+            
+            let functionPatterns = [
+                NSRegularExpression(#"a\.[a-zA-Z]\s*&&\s*\([a-z]\s*=\s*a\.get\("n"\)\)\s*&&\s*"#),
+                NSRegularExpression(#"\([a-z]\s*=\s*([a-zA-Z0-9$]+)(\[\d+\])?\([a-z]\)"#)
+            ]
+            
+            for pattern in functionPatterns {
+                guard let (_, functionMatchGroups) = pattern.allMatches(in: js, includingGroups: [1, 2]).first else { continue }
+                guard let firstGroup = functionMatchGroups[1] else { continue }
+                guard let secondGroup = functionMatchGroups[2] else {
+                    return firstGroup.content
+                }
+                
+                guard let index = Int(secondGroup.content.strip(from: "[]")) else { continue }
+                let arrayPattern = NSRegularExpression(#"var "# + NSRegularExpression.escapedPattern(for: firstGroup.content) + #"\s*=\s*(\[.+?\])\s*[,;]"#)
+                if let arrayMatch = arrayPattern.firstMatch(in: js, group: 1) {
+                    let array = arrayMatch.content.strip(from: "[]").split(separator: ",").map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                    if array.indices.contains(index) {
+                        return array[index]
+                    }
                 }
             }
         }
-
-        return name
+        
+        throw YouTubeKitError.regexMatchError
     }
     
     /// Extract the raw code for the throttling function.
@@ -360,4 +439,3 @@ class Cipher {
     }
     
 }
-
