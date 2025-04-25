@@ -225,10 +225,9 @@ class Cipher {
     
     /// Extract the name of the function that computes the throttling parameter.
     class func getThrottlingFunctionName(js: String) throws -> String {
-        
         let functionName: String
         let index: Int?
-        
+
         if #available(iOS 16.0, macOS 13.0, watchOS 9.0, tvOS 16.0, *) {
             /*
              Full regex pattern:
@@ -253,7 +252,7 @@ class Cipher {
              
              -> We split it up in two, as Swift can't handle the conditional (on the last line). So we handle it in code
              */
-            
+
             let patternWithVar = #/
             (?x)
             (?:
@@ -261,7 +260,7 @@ class Cipher {
             )(?P<nfunc>[a-zA-Z0-9_$]+)(?:\[(?P<idx>\d+)\])?\([a-zA-Z]\)
             (,[a-zA-Z0-9_$]+\.set\((?:"n+"|[a-zA-Z0-9_$]+)\,(?P=var)\))
             /#
-            
+
             let patternWithoutVar = #/
             (?x)
             (?:
@@ -278,30 +277,38 @@ class Cipher {
                     )\)&&\(c=
             )(?P<nfunc>[a-zA-Z0-9_$]+)(?:\[(?P<idx>\d+)\])?\([a-zA-Z]\)
             /#
-            
+
+            // Modern "short" call: c=a.get("n"))&&(c=Jn(c))
+            let simplePattern = #/
+            (?x)
+            \.get\("n"\)\)\s*&&\s*\(c=(?P<nfunc>[a-zA-Z0-9_$]+)\(
+            /#
+
             if let match = try patternWithVar.firstMatch(in: js) {
                 functionName = String(match.nfunc)
-                index = match.idx.flatMap { Int($0) }
+                index        = match.idx.flatMap { Int($0) }
             } else if let match = try patternWithoutVar.firstMatch(in: js) {
                 functionName = String(match.nfunc)
-                index = match.idx.flatMap { Int($0) }
+                index        = match.idx.flatMap { Int($0) }
+            } else if let match = try simplePattern.firstMatch(in: js) {
+                functionName = String(match.nfunc)
+                index        = nil                // прямой вызов – индекса нет
             } else {
                 throw YouTubeKitError.regexMatchError
             }
-            
-            guard let index else {
-                os_log("extracted throttle function name %{public}@ but no index", log: log, type: .error, functionName)
-                throw YouTubeKitError.regexMatchError
+
+            // Если индекс отсутствует, функция вызывается напрямую – можно вернуть её имя сразу.
+            if index == nil {
+                return functionName
             }
-            
+
             let arrayPattern = NSRegularExpression(#"var "# + NSRegularExpression.escapedPattern(for:functionName) + #"\s*=\s*(\[.+?\])\s*[,;]"#)
             if let arrayMatch = arrayPattern.firstMatch(in: js, group: 1) {
                 let array = arrayMatch.content.strip(from: "[]").split(separator: ",").map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-                if array.indices.contains(index) {
-                    return array[index]
+                if array.indices.contains(index!) {
+                    return array[index!]
                 }
             }
-            
         } else {
             
             let functionPatterns = [
