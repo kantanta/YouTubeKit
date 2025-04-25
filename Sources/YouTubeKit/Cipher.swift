@@ -284,15 +284,33 @@ class Cipher {
             \.get\("n"\)\)\s*&&\s*\(c=(?P<nfunc>[a-zA-Z0-9_$]+)\(
             /#
 
+            // Indirect read: b = String.fromCharCode(110); … c=a.get(b))&&(c=Ab[c](a))
+            let indirectPattern = #/
+            (?x)
+            String\.fromCharCode\(110\).*?               # b = String.fromCharCode(110) …
+            c=a\.
+              (?:
+                  get\(\s*[a-zA-Z0-9_$]+\s*\)            # c=a.get(b)
+                | [a-zA-Z0-9_$]+\[\s*[a-zA-Z0-9_$]+\s*\]\|\|null
+              )
+            \)\s*\)\s*&&\s*\(c=
+            (?P<nfunc>[a-zA-Z0-9_$]+)                    # <- имя функции
+            (?:\[(?P<idx>\d+)\])?                        # опциональный индекс
+            \([a-zA-Z]\)
+            /#
+
             if let match = try patternWithVar.firstMatch(in: js) {
                 functionName = String(match.nfunc)
                 index        = match.idx.flatMap { Int($0) }
             } else if let match = try patternWithoutVar.firstMatch(in: js) {
                 functionName = String(match.nfunc)
                 index        = match.idx.flatMap { Int($0) }
+            } else if let match = try indirectPattern.firstMatch(in: js) {
+                functionName = String(match.nfunc)
+                index        = match.idx.flatMap { Int($0) }
             } else if let match = try simplePattern.firstMatch(in: js) {
                 functionName = String(match.nfunc)
-                index        = nil                // прямой вызов – индекса нет
+                index        = nil
             } else {
                 throw YouTubeKitError.regexMatchError
             }
